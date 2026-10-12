@@ -353,14 +353,6 @@ class TurkbelgeService
             $x .= "</cac:BillingReference>\n";
         }
 
-        if ($para !== 'TRY' && $kur > 0) {
-            $x .= "<cac:PricingExchangeRate>\n";
-            $x .= "  <cbc:SourceCurrencyCode>$para</cbc:SourceCurrencyCode>\n";
-            $x .= "  <cbc:TargetCurrencyCode>TRY</cbc:TargetCurrencyCode>\n";
-            $x .= "  <cbc:CalculationRate>" . number_format($kur, 4, '.', '') . "</cbc:CalculationRate>\n";
-            $x .= "</cac:PricingExchangeRate>\n";
-        }
-
         // 3. XSLT Şablon Eklemesi
         $xsltYolu = $isEArsiv 
             ? __DIR__ . '/../assets/xslt/0_arsivfatura.xslt'
@@ -493,7 +485,18 @@ class TurkbelgeService
         }
         $x .= "</cac:Party></cac:AccountingCustomerParty>\n";
 
-        // 5b. Belge düzeyinde iskonto (AllowanceCharge)
+        // UBL-TR şema sırası (UBL-Invoice-2.1.xsd): Alıcı → PaymentMeans → AllowanceCharge → PricingExchangeRate → TaxTotal
+        // Sıra bozulursa servis 10003 (şema hatası) döner.
+
+        // 5b. Ödeme Bilgisi — e-Arşiv'de zorunlu (gönderim şekli)
+        if ($isEArsiv) {
+            $x .= "<cac:PaymentMeans>\n";
+            $x .= "  <cbc:PaymentMeansCode>1</cbc:PaymentMeansCode>\n";
+            $x .= "  <cbc:PaymentChannelCode>ELEKTRONIK</cbc:PaymentChannelCode>\n";
+            $x .= "</cac:PaymentMeans>\n";
+        }
+
+        // 5c. Belge düzeyinde iskonto (AllowanceCharge)
         if ($iskontoTutar > 0) {
             $x .= "<cac:AllowanceCharge>\n";
             $x .= "  <cbc:ChargeIndicator>false</cbc:ChargeIndicator>\n";
@@ -503,12 +506,13 @@ class TurkbelgeService
             $x .= "</cac:AllowanceCharge>\n";
         }
 
-        // 5c. Ödeme Bilgisi — e-Arşiv'de zorunlu (gönderim şekli)
-        if ($isEArsiv) {
-            $x .= "<cac:PaymentMeans>\n";
-            $x .= "  <cbc:PaymentMeansCode>1</cbc:PaymentMeansCode>\n";
-            $x .= "  <cbc:PaymentChannelCode>ELEKTRONIK</cbc:PaymentChannelCode>\n";
-            $x .= "</cac:PaymentMeans>\n";
+        // 5d. Döviz kuru
+        if ($para !== 'TRY' && $kur > 0) {
+            $x .= "<cac:PricingExchangeRate>\n";
+            $x .= "  <cbc:SourceCurrencyCode>$para</cbc:SourceCurrencyCode>\n";
+            $x .= "  <cbc:TargetCurrencyCode>TRY</cbc:TargetCurrencyCode>\n";
+            $x .= "  <cbc:CalculationRate>" . number_format($kur, 4, '.', '') . "</cbc:CalculationRate>\n";
+            $x .= "</cac:PricingExchangeRate>\n";
         }
 
         // 6. KDV Toplamı
