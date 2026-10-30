@@ -233,7 +233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 break;
 
             case 'get_products':
-                $urunler = $db->fetchAll("SELECT urun_hizmet_id as Urun_id, urun_hizmet_adi as Urun_Adi, urun_hizmet_kodu as Urun_Kodu, ISNULL(Urun_Stok_Miktari, 0) as Stok_Miktari FROM dbo.Urun_Hizmet WHERE urun_hizmet_durum = 1 ORDER BY urun_hizmet_adi");
+                $urunler = $db->fetchAll("SELECT urun_hizmet_id as Urun_id, urun_hizmet_adi as Urun_Adi, urun_hizmet_kodu as Urun_Kodu, ISNULL(Urun_Stok_Miktari, 0) as Stok_Miktari, CAST(ISNULL(urun_hizmet_durum, 0) AS INT) as Urun_Durum FROM dbo.Urun_Hizmet ORDER BY urun_hizmet_durum DESC, urun_hizmet_adi");
                 $kdvler = $db->fetchAll("SELECT kdv_id, kdv_adi, kdv_oran FROM UrunHizmet_KDVTanimlari WHERE kdv_durum = 1 ORDER BY kdv_sira_no, kdv_oran DESC");
                 echo json_encode(['success' => true, 'data' => $urunler, 'kdvler' => $kdvler]);
                 break;
@@ -507,6 +507,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'Durum'                => 1
                     ]);
                     sqlsrv_query($db->getConnection(), "UPDATE dbo.Urun_Hizmet SET Urun_Stok_Miktari = ISNULL(Urun_Stok_Miktari, 0) + $miktar WHERE urun_hizmet_id = $urunId");
+
+                    // Pasif ürün eşleştirildiyse aktif yap
+                    $db->query(
+                        "UPDATE dbo.Urun_Hizmet SET urun_hizmet_durum = 1, urun_hizmet_guncelleme_tarihi = GETDATE(), urun_hizmet_guncelleyen_kullanici_id = ?
+                         WHERE urun_hizmet_id = ? AND ISNULL(urun_hizmet_durum, 0) = 0",
+                        [$user['kullanici_id'], $urunId]
+                    );
                 }
 
                 // FaturalarGelenKalemleri: sıra başına DELETE + INSERT (çoklu split destekli)
@@ -1316,6 +1323,12 @@ function urunWildcardMatcher(params, data) {
 let sistemUrunleri = [];
 let sistemKdvler = [];
 
+// Dropdown seçenek metni (pasif ürünler işaretlenir, kayıtta aktif yapılır)
+function urunOptionText(u) {
+    const pasif = parseInt(u.Urun_Durum) === 1 ? '' : ' [PASİF]';
+    return `[${u.Urun_Kodu || '-'}] ${u.Urun_Adi} (Stok: ${parseFloat(u.Stok_Miktari)})${pasif}`;
+}
+
 function openStokModal(faturaNo, faturaId) {
     $('#modalFaturaNo').text(faturaNo);
     $('#modalFaturaId').val(faturaId);
@@ -1392,7 +1405,7 @@ function fetchInvoiceLines(faturaNo) {
                         let optHtml = '<option value="">-- Ürün Seçin --</option>';
                         sistemUrunleri.forEach(u => {
                             const sel = (parseInt(esl.urun_hizmet_id) === parseInt(u.Urun_id)) ? 'selected' : '';
-                            optHtml += `<option value="${u.Urun_id}" ${sel}>[${u.Urun_Kodu || '-'}] ${u.Urun_Adi} (Stok: ${parseFloat(u.Stok_Miktari)})</option>`;
+                            optHtml += `<option value="${u.Urun_id}" ${sel}>${urunOptionText(u)}</option>`;
                         });
                         const showSil = eslestirmeler.length > 1 ? '' : 'display:none';
                         eslesmeRowsHtml += `
@@ -1417,7 +1430,7 @@ function fetchInvoiceLines(faturaNo) {
                     let optHtml = '<option value="">-- Ürün Seçin --</option>';
                     sistemUrunleri.forEach(u => {
                         const sel = (autoMatchId && parseInt(autoMatchId) === parseInt(u.Urun_id)) ? 'selected' : '';
-                        optHtml += `<option value="${u.Urun_id}" ${sel}>[${u.Urun_Kodu || '-'}] ${u.Urun_Adi} (Stok: ${parseFloat(u.Stok_Miktari)})</option>`;
+                        optHtml += `<option value="${u.Urun_id}" ${sel}>${urunOptionText(u)}</option>`;
                     });
                     eslesmeRowsHtml = `
                         <div class="eslesme-satir d-flex gap-1 mb-1 align-items-center">
@@ -1607,7 +1620,7 @@ $(document).on('click', '.btn-eslesme-ekle', function() {
 
     let emptyOpts = '<option value="">-- Ürün Seçin --</option>';
     sistemUrunleri.forEach(u => {
-        emptyOpts += `<option value="${u.Urun_id}">[${u.Urun_Kodu || '-'}] ${u.Urun_Adi} (Stok: ${parseFloat(u.Stok_Miktari)})</option>`;
+        emptyOpts += `<option value="${u.Urun_id}">${urunOptionText(u)}</option>`;
     });
 
     const yeniSatir = `
