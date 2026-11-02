@@ -42,6 +42,30 @@ $menuAdi = $pageInfo['menu_adi'] ?? null;
 $siteAyarlari = $db->fetchOne("SELECT TOP 1 site_ayarlari_site_title FROM dbo.tanim_site_ayarlari ORDER BY site_ayarlari_id DESC");
 $siteTitle = $siteAyarlari['site_ayarlari_site_title'] ?? 'Örnek Yazılım Portal';
 
+// Gelen kutusu okunabilecek firmalar (Türkbelge PROD kanalları); varsayılan kanal başta
+$turkbelgeKanallari = $db->fetchAll("
+    SELECT ek.Kanal_Id, ek.Kanal_Adi, ek.Kanal_Parametreler
+    FROM EntegrasyonKanallari ek
+    INNER JOIN Entegrasyon e ON ek.Kanal_Entegrasyon_Id = e.Entegrasyon_Id
+    WHERE e.Entegrasyon_Kod = 'TURKBELGE' AND ek.Kanal_Ortam = 'PROD'
+      AND ek.Kanal_Durum = 1 AND ek.Durum = 1
+    ORDER BY ek.Kanal_Varsayilan DESC, ek.Kanal_Id
+");
+
+// Cari_CariTipleri: Tedarikci (filtre ve "tedarikçi olarak ekle" butonu)
+$tedarikciTipiId = 3;
+
+// İstemciden gelen kanal id'sini yalnız bu listeden kabul et
+function gelenKanalBul(array $kanallar, $kanalId): array
+{
+    foreach ($kanallar as $k) {
+        if ((int)$k['Kanal_Id'] === (int)$kanalId) return $k;
+    }
+    if (empty($kanallar)) throw new Exception('Aktif Türkbelge kanalı bulunamadı.');
+    if ($kanalId) throw new Exception('Geçersiz firma seçimi.');
+    return $kanallar[0];
+}
+
 // AJAX Islemleri
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (ob_get_level()) {
@@ -54,14 +78,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         switch ($action) {
             case 'list':
-                // Kanal bilgilerini al
-                $kanal = $db->fetchOne("
-                    SELECT ek.Kanal_Id, ek.Kanal_Parametreler
-                    FROM EntegrasyonKanallari ek
-                    INNER JOIN Entegrasyon e ON ek.Kanal_Entegrasyon_Id = e.Entegrasyon_Id
-                    WHERE e.Entegrasyon_Kod = 'TURKBELGE' AND ek.Kanal_Id = 1 AND ek.Kanal_Durum = 1
-                ");
-                $kanalId = (int)($kanal['Kanal_Id'] ?? 0);
+                // Firma seçilmediyse (Tümü) tüm Türkbelge kanalları işlenir
+                $secilenKanalId = (int)($_POST['kanal_id'] ?? 0);
+                $hedefKanallar = $secilenKanalId
+                    ? [gelenKanalBul($turkbelgeKanallari, $secilenKanalId)]
+                    : $turkbelgeKanallari;
+                if (!$hedefKanallar) throw new Exception('Aktif Türkbelge kanalı bulunamadı.');
+
+                $yenile = (int)($_POST['yenile'] ?? 0);
+                $cekim = null;
+
+                foreach ($hedefKanallar as $kanal) {
+                $kanalId = (int)$kanal['Kanal_Id'];
                 $params  = json_decode($kanal['Kanal_Parametreler'] ?? '{}', true);
                 $efaturaWsdl = $params['wsdl_efatura'] ?? null;
 
@@ -72,13 +100,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $efaturaWsdl = 'https://efaturaws.turkbelge.com.tr/EFaturaOIB?wsdl';
                 }
 
-                // API'den cek (yenile=1 ise veya DB bos ise)
-                $yenile = (int)($_POST['yenile'] ?? 0);
-                $dbSayisi = $db->fetchOne("SELECT COUNT(*) AS s FROM dbo.FaturalarGelen")['s'] ?? 0;
+                // API'den cek (yenile=1 ise veya o firmanın DB kaydı yoksa)
+                $dbSayisi = $db->fetchOne("SELECT COUNT(*) AS s FROM dbo.FaturalarGelen WHERE FaturalarGelen_Kanal_id = ?", [$kanalId])['s'] ?? 0;
 
                 if ($yenile || $dbSayisi == 0) {
                     // API Login
-                    $api = new TurkbelgeAPI($db);
+                    $api = new TurkbelgeAPI($db, 'PROD', $kanalId);
                     $api->login();
 
                     $reflection = new ReflectionClass($api);
@@ -99,30 +126,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $sonTarih = $db->fetchOne("
                         SELECT CONVERT(VARCHAR(10), MAX(FaturalarGelen_Tarih), 120) AS son_tarih
                         FROM dbo.FaturalarGelen
-                    ")['son_tarih'] ?? null;
+                        WHERE FaturalarGelen_Kanal_id = ?
+                    ", [$kanalId])['son_tarih'] ?? null;
 
                     // Son tarih varsa oradan 15 gün geriden başlat, yoksa 30 gün geriden
                     $startDate = $sonTarih
                         ? date('Y-m-d', strtotime($sonTarih . ' -15 days'))
                         : date('Y-m-d', strtotime('-30 days'));
 
-                    $apiResponse = $efaturaClient->GetInvoice([
-                        'REQUEST_HEADER' => [
-                            'SESSION_ID'       => $sessionId,
-                            'APPLICATION_NAME' => 'ORNEK_PORTAL',
-                            'COMPRESSED'       => 'N'
-                        ],
-                        'INVOICE_SEARCH_KEY' => [
-                            'LIMIT'         => 500,
-                            'DIRECTION'     => 'IN',
-                            'READ_INCLUDED' => true,
-                            'START_DATE'    => $startDate
-                        ],
-                        'HEADER_ONLY' => 'Y'
-                    ]);
+                    // Türkbelge tek çağrıda en fazla 100 fatura döndürür (LIMIT daha büyük verilse de).
+                    // Sınıra takılan tarih aralığı ikiye bölünüp yeniden sorgulanır.
+                    $apiSayfaSiniri = 100;
+                    $eksikGunler = [];
+                    $aralikCek = function ($bas, $bit) use (&$aralikCek, &$eksikGunler, $efaturaClient, $sessionId, $apiSayfaSiniri) {
+                        $resp = $efaturaClient->GetInvoice([
+                            'REQUEST_HEADER' => [
+                                'SESSION_ID'       => $sessionId,
+                                'APPLICATION_NAME' => 'ORNEK_PORTAL',
+                                'COMPRESSED'       => 'N'
+                            ],
+                            'INVOICE_SEARCH_KEY' => [
+                                'LIMIT'         => $apiSayfaSiniri,
+                                'DIRECTION'     => 'IN',
+                                'READ_INCLUDED' => true,
+                                'START_DATE'    => $bas,
+                                'END_DATE'      => $bit
+                            ],
+                            'HEADER_ONLY' => 'Y'
+                        ]);
+                        $liste = isset($resp->INVOICE) ? (is_array($resp->INVOICE) ? $resp->INVOICE : [$resp->INVOICE]) : [];
+                        if (count($liste) < $apiSayfaSiniri) return $liste;
 
-                    if (isset($apiResponse->INVOICE)) {
-                        $invoices = is_array($apiResponse->INVOICE) ? $apiResponse->INVOICE : [$apiResponse->INVOICE];
+                        // Tek günde sınır aşıldıysa daha fazla bölünemez; eksik kalabilir
+                        if ($bas >= $bit) {
+                            $eksikGunler[] = $bas;
+                            return $liste;
+                        }
+                        $gunFarki = (int)round((strtotime($bit) - strtotime($bas)) / 86400);
+                        $orta = date('Y-m-d', strtotime($bas . ' +' . intdiv($gunFarki, 2) . ' days'));
+                        return array_merge(
+                            $aralikCek($bas, $orta),
+                            $aralikCek(date('Y-m-d', strtotime($orta . ' +1 day')), $bit)
+                        );
+                    };
+
+                    $invoices = $aralikCek($startDate, date('Y-m-d', strtotime('+1 day')));
+                    $yeniSayisi = 0;
+
+                    if ($invoices) {
                         foreach ($invoices as $inv) {
                             $header = $inv->HEADER ?? null;
                             if (!$header) continue;
@@ -160,23 +211,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     'FaturalarGelen_ParaBirimi' => $paraBirimi,
                                     'FaturalarGelen_Durum'      => mb_substr($header->STATUS_DESCRIPTION ?? '', 0, 100),
                                     'FaturalarGelen_GIBDurum'   => mb_substr($header->GIB_STATUS_DESCRIPTION ?? '', 0, 100),
-                                    'FaturalarGelen_Kanal_id'   => $kanalId > 0 ? $kanalId : null,
+                                    'FaturalarGelen_Kanal_id'   => $kanalId,
                                     'OlusturanKullanici'        => $user['kullanici_id'],
                                     'OlusturmaTarihi'           => date('Y-m-d H:i:s'),
                                     'Durum'                     => 1
                                 ]);
+                                $yeniSayisi++;
                             } catch (Exception $dupEx) {
                                 // Zaten kayitli, gec
                             }
                         }
                     }
+
+                    // Firmaların çekim sonuçları toplanır
+                    $cekim = $cekim ?? ['api_sayisi' => 0, 'yeni_sayisi' => 0, 'eksik_gunler' => []];
+                    $cekim['api_sayisi']  += count($invoices);
+                    $cekim['yeni_sayisi'] += $yeniSayisi;
+                    foreach ($eksikGunler as $g) $cekim['eksik_gunler'][] = $kanal['Kanal_Adi'] . ' ' . $g;
+                }
                 }
 
-                $cariTipiFiltre = $_POST['cari_tipi_id'] ?? '3'; // Default olarak 3 (Tedarikçi) gelsin
-                
+                $cariTipiFiltre = $_POST['cari_tipi_id'] ?? (string)$tedarikciTipiId; // Varsayılan: Tedarikçi
+
                 $where = "f.Durum = 1";
                 $params = [];
-                
+                if ($secilenKanalId) {
+                    $where .= " AND f.FaturalarGelen_Kanal_id = ?";
+                    $params[] = $secilenKanalId;
+                }
+
                 if ($cariTipiFiltre !== '') {
                     $where .= " AND c.cari_tipi_id = ?";
                     $params[] = $cariTipiFiltre;
@@ -199,9 +262,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         f.FaturalarGelen_GIBDurum AS gib_durum,
                         f.FaturalarGelen_StokIslendi AS stok_islendi,
                         c.cari_id,
+                        c.cari_tipi_id,
                         c.cari_adi,
                         c.cari_unvan as db_cari_unvan,
                         iade.iade_no_listesi,
+                        ek.Kanal_Adi AS kanal_adi,
                         CASE
                             WHEN f.FaturalarGelen_ParaBirimi = 'USD' THEN sh.DolarKur
                             WHEN f.FaturalarGelen_ParaBirimi = 'EUR' THEN sh.EuroKur
@@ -209,6 +274,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         END AS kur
                     FROM dbo.FaturalarGelen f
                     LEFT JOIN dbo.Cari c ON f.FaturalarGelen_VKN_TCKN = c.cari_vergi_no
+                    LEFT JOIN dbo.EntegrasyonKanallari ek ON ek.Kanal_Id = f.FaturalarGelen_Kanal_id
                     OUTER APPLY (
                         SELECT TOP 1 DolarKur, EuroKur
                         FROM dbo.Urun_Stok_Hareketleri
@@ -229,7 +295,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ORDER BY f.FaturalarGelen_Tarih DESC, f.FaturalarGelen_id DESC
                 ", $params);
 
-                echo json_encode(['success' => true, 'data' => $faturalar]);
+                echo json_encode(['success' => true, 'data' => $faturalar, 'cekim' => $cekim]);
+                break;
+
+            case 'tedarikci_kaydet':
+                // Fatura gönderen firmayı tedarikçi cari olarak ekle; VKN'li cari varsa tipini tedarikçi yap
+                $vkn   = preg_replace('/\D/', '', $_POST['vkn'] ?? '');
+                $unvan = trim($_POST['unvan'] ?? '');
+                if (strlen($vkn) !== 10 && strlen($vkn) !== 11) throw new Exception('Geçerli bir VKN/TCKN bulunamadı.');
+                if ($unvan === '') throw new Exception('Ünvan bilgisi eksik.');
+
+                $mevcut = $db->fetchOne("SELECT COUNT(*) AS s FROM dbo.Cari WHERE cari_vergi_no = ?", [$vkn]);
+                if ((int)($mevcut['s'] ?? 0) > 0) {
+                    $db->execute("
+                        UPDATE dbo.Cari
+                        SET cari_tipi_id = ?, cari_guncelleme_tarihi = GETDATE(), cari_guncelleyen_kullanici = ?
+                        WHERE cari_vergi_no = ?
+                    ", [$tedarikciTipiId, $user['kullanici_id'], $vkn]);
+                    echo json_encode(['success' => true, 'message' => 'Cari kartı tedarikçi olarak güncellendi.']);
+                } else {
+                    $db->insert('Cari', [
+                        'cari_tipi_id'               => $tedarikciTipiId,
+                        'cari_adi'                   => mb_substr($unvan, 0, 255),
+                        'cari_unvan'                 => mb_substr($unvan, 0, 255),
+                        'cari_vergi_no'              => $vkn,
+                        'cari_aktif'                 => 1,
+                        'cari_olusturma_tarihi'      => date('Y-m-d H:i:s'),
+                        'cari_olusturan_kullanici'   => $user['kullanici_id'],
+                        'cari_guncelleme_tarihi'     => date('Y-m-d H:i:s'),
+                        'cari_guncelleyen_kullanici' => $user['kullanici_id'],
+                    ]);
+                    echo json_encode(['success' => true, 'message' => 'Tedarikçi cari kartı oluşturuldu.']);
+                }
                 break;
 
             case 'get_products':
@@ -242,13 +339,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $faturaNo = $_POST['fatura_no'] ?? '';
                 if (!$faturaNo) throw new Exception("Fatura numarasi eksik.");
                 
-                // API'den detay cek
-                $kanal = $db->fetchOne("SELECT ek.Kanal_Parametreler FROM EntegrasyonKanallari ek INNER JOIN Entegrasyon e ON ek.Kanal_Entegrasyon_Id = e.Entegrasyon_Id WHERE e.Entegrasyon_Kod = 'TURKBELGE' AND ek.Kanal_Id = 1 AND ek.Kanal_Durum = 1");
+                // API'den detay cek (faturanın düştüğü firmanın gelen kutusundan)
+                $faturaKanal = $db->fetchOne("SELECT FaturalarGelen_Kanal_id FROM dbo.FaturalarGelen WHERE FaturalarGelen_FaturaNo = ?", [$faturaNo]);
+                $kanal = gelenKanalBul($turkbelgeKanallari, (int)($faturaKanal['FaturalarGelen_Kanal_id'] ?? 0));
                 $params = json_decode($kanal['Kanal_Parametreler'] ?? '{}', true);
                 $efaturaWsdl = $params['wsdl_efatura'] ?? 'https://efaturaws.turkbelge.com.tr/EFaturaOIB?wsdl';
                 if (strpos($efaturaWsdl, 'test') !== false) $efaturaWsdl = str_replace('efaturawstest', 'efaturaws', $efaturaWsdl);
 
-                $api = new TurkbelgeAPI($db);
+                $api = new TurkbelgeAPI($db, 'PROD', (int)$kanal['Kanal_Id']);
                 $api->login();
                 $ref = new ReflectionClass($api);
                 $prop = $ref->getProperty('sessionId');
@@ -778,8 +876,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <input type="text" id="f_tip" class="form-control" placeholder="Tip...">
                                 </div>
                                 <div class="col-md-2 d-flex align-items-end">
-                                    <div class="form-check mb-1">
-                                        <input class="form-check-input" type="checkbox" id="f_sadece_tedarikci" checked>
+                                    <div class="form-check form-switch mb-1">
+                                        <input class="form-check-input" type="checkbox" role="switch" id="f_sadece_tedarikci" checked>
                                         <label class="form-check-label fw-semibold" for="f_sadece_tedarikci">
                                             <i class="bi bi-building me-1"></i>Sadece Tedarikçi
                                         </label>
@@ -817,7 +915,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <h3 class="card-title mb-0"><i class="bi bi-inbox me-1"></i>Gelen e-Faturalar</h3>
-                        <div class="d-flex gap-2">
+                        <div class="d-flex gap-2 align-items-center">
+                            <div style="min-width:220px">
+                                <select id="f_kanal" class="form-select form-select-sm" style="width:100%" title="Gelen kutusu okunacak firma">
+                                    <option value="" selected>Tümü</option>
+                                    <?php foreach ($turkbelgeKanallari as $k): ?>
+                                    <option value="<?= (int)$k['Kanal_Id'] ?>"><?= htmlspecialchars($k['Kanal_Adi']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
                             <button class="btn btn-success btn-sm" id="btnExcelIndir">
                                 <i class="bi bi-file-earmark-excel me-1"></i>Excel İndir
                             </button>
@@ -953,6 +1059,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 <script>
 let table;
+const TEDARIKCI_TIPI_ID = '<?= (int)$tedarikciTipiId ?>';
 
 function formatTutar(tutar, paraBirimi) {
     const formatted = parseFloat(tutar).toLocaleString('tr-TR', {
@@ -1078,9 +1185,10 @@ function loadFaturalar(yenile) {
     $('#faturaTable').closest('.table-responsive').hide();
 
     $.post('', { 
-        action: 'list', 
+        action: 'list',
         yenile: yenile ? 1 : 0,
-        cari_tipi_id: $('#f_sadece_tedarikci').is(':checked') ? '3' : ''
+        kanal_id: $('#f_kanal').val() || '',
+        cari_tipi_id: $('#f_sadece_tedarikci').is(':checked') ? TEDARIKCI_TIPI_ID : ''
     }, function(resp) {
         $('#loadingOverlay').hide();
         $('#faturaTable').closest('.table-responsive').show();
@@ -1096,6 +1204,18 @@ function loadFaturalar(yenile) {
 
         table.clear();
         table.rows.add(resp.data).draw();
+
+        // API'den çekim yapıldıysa sonucu bildir
+        if (resp.cekim) {
+            const c = resp.cekim;
+            const mesaj = 'API: ' + c.api_sayisi + ' fatura, ' + c.yeni_sayisi + ' yeni kayıt eklendi.';
+            if (c.eksik_gunler && c.eksik_gunler.length) {
+                Swal.fire('Uyarı', mesaj + '<br>Şu günlerde 100\'den fazla fatura olduğu için liste eksik olabilir: '
+                    + c.eksik_gunler.join(', '), 'warning');
+            } else if (typeof showToast === 'function') {
+                showToast(mesaj, 'success');
+            }
+        }
 
         // InfoBox guncelle
         const data = resp.data;
@@ -1125,6 +1245,10 @@ $(function() {
                 data: 'fatura_no',
                 render: function(data, type, row) {
                     let no = '<strong>' + data + '</strong>';
+                    // Tümü seçiliyken faturanın geldiği firma
+                    if (type === 'display' && !$('#f_kanal').val() && row.kanal_adi) {
+                        no += ' <span class="badge text-bg-light border">' + htmlEsc(row.kanal_adi) + '</span>';
+                    }
                     // Bu faturaya kesilmiş iade faturaları alt satırda listelenir
                     if (type === 'display' && row.iade_no_listesi) {
                         no += '<div class="small text-danger" title="Kesilen iade faturaları">'
@@ -1149,11 +1273,21 @@ $(function() {
             {
                 data: 'unvan',
                 className: 'text-nowrap',
-                render: function(data, type) {
+                render: function(data, type, row) {
                     if (!data || data === '-') return '-';
                     if (type !== 'display') return data;   // arama/siralama tam degerde kalsin
-                    return '<span title="' + htmlEsc(data) + '">'
+                    let html = '<span title="' + htmlEsc(data) + '">'
                          + htmlEsc(data.length > 20 ? data.substring(0, 20) + '…' : data) + '</span>';
+                    // Tedarikçi filtresi kapalıyken tedarikçi olmayan firmalar için ekle/güncelle butonu
+                    if (!$('#f_sadece_tedarikci').is(':checked') && row.vkn_tckn
+                        && String(row.cari_tipi_id || '') !== TEDARIKCI_TIPI_ID) {
+                        const mevcut = row.cari_id ? 1 : 0;
+                        html += ' <button type="button" class="btn btn-outline-success btn-sm py-0 px-1 ms-1 btn-tedarikci-kaydet"'
+                              + ' data-vkn="' + htmlEsc(row.vkn_tckn) + '" data-unvan="' + htmlEsc(data) + '" data-mevcut="' + mevcut + '"'
+                              + ' title="' + (mevcut ? 'Tedarikçi olarak güncelle' : 'Tedarikçi olarak ekle') + '">'
+                              + '<i class="bi ' + (mevcut ? 'bi-arrow-repeat' : 'bi-plus-lg') + '"></i></button>';
+                    }
+                    return html;
                 }
             },
             {
@@ -1294,6 +1428,41 @@ $(function() {
     // Checkbox değiştiğinde otomatik yenile
     $('#f_sadece_tedarikci').on('change', function() {
         loadFaturalar();
+    });
+
+    // Firma (Türkbelge kanalı) değişince o firmanın gelen kutusunu listele
+    $('#f_kanal').select2({ theme: 'bootstrap-5', width: '100%' })
+        .on('change', function() {
+            loadFaturalar();
+        });
+
+    // Ünvan yanındaki butonla firmayı tedarikçi cari olarak ekle/güncelle
+    $('#faturaTable').on('click', '.btn-tedarikci-kaydet', function() {
+        const vkn   = $(this).data('vkn');
+        const unvan = $(this).data('unvan');
+        const guncelle = $(this).data('mevcut') == 1;
+        Swal.fire({
+            icon: 'question',
+            title: guncelle ? 'Tedarikçi Olarak Güncelle' : 'Tedarikçi Olarak Ekle',
+            html: '<strong>' + htmlEsc(unvan) + '</strong><br><small>VKN/TCKN: ' + htmlEsc(vkn) + '</small><br><br>'
+                + (guncelle ? 'Mevcut cari kartın tipi <strong>Tedarikçi</strong> yapılacak.'
+                            : 'Bu firma için <strong>Tedarikçi</strong> tipinde cari kartı açılacak.'),
+            showCancelButton: true,
+            confirmButtonText: guncelle ? 'Güncelle' : 'Ekle',
+            cancelButtonText: 'Vazgeç'
+        }).then(function(r) {
+            if (!r.isConfirmed) return;
+            $.post('', { action: 'tedarikci_kaydet', vkn: vkn, unvan: unvan }, function(resp) {
+                if (typeof showToast === 'function') {
+                    showToast(resp.message || (resp.success ? 'Kaydedildi' : 'İşlem başarısız'), resp.success ? 'success' : 'error');
+                } else {
+                    Swal.fire(resp.success ? 'Başarılı' : 'Hata', resp.message || '', resp.success ? 'success' : 'error');
+                }
+                if (resp.success) loadFaturalar();
+            }, 'json').fail(function(xhr) {
+                Swal.fire('Hata', 'Sunucu hatası: ' + xhr.statusText, 'error');
+            });
+        });
     });
 
     // Select2 Modal Fix

@@ -57,22 +57,21 @@ function renderXmlAsHtml(string $xmlString, bool $isEArsiv = false): void
 }
 
 // ── Yardımcı: GİB API'den fatura XML'i çek ───────────────────────────────────
-function fetchXmlFromGib($db, string $faturaNo, string $direction): ?string
+function fetchXmlFromGib($db, string $faturaNo, string $direction, int $kanalId = 1): ?string
 {
     $kanal = $db->fetchOne("
         SELECT ek.Kanal_Parametreler
         FROM EntegrasyonKanallari ek
         INNER JOIN Entegrasyon e ON ek.Kanal_Entegrasyon_Id = e.Entegrasyon_Id
-        WHERE e.Entegrasyon_Kod = 'TURKBELGE' AND ek.Kanal_Durum = 1
-        ORDER BY ek.Kanal_Varsayilan DESC
-    ");
+        WHERE e.Entegrasyon_Kod = 'TURKBELGE' AND ek.Kanal_Id = ? AND ek.Kanal_Durum = 1
+    ", [$kanalId]);
     $params      = json_decode($kanal['Kanal_Parametreler'] ?? '{}', true);
     $efaturaWsdl = $params['wsdl_efatura'] ?? 'https://efaturaws.turkbelge.com.tr/EFaturaOIB?wsdl';
     if (strpos($efaturaWsdl, 'test') !== false) {
         $efaturaWsdl = str_replace('efaturawstest', 'efaturaws', $efaturaWsdl);
     }
 
-    $api = new TurkbelgeAPI($db);
+    $api = new TurkbelgeAPI($db, 'PROD', $kanalId);
     $api->login();
     $reflection  = new ReflectionClass($api);
     $sessionProp = $reflection->getProperty('sessionId');
@@ -131,8 +130,14 @@ try {
         if ($direction !== 'OUT') $direction = 'IN';
     }
 
+    // Fatura hangi firmanın (Türkbelge hesabının) kutusundaysa o kanalla bağlanılır
+    $faturaKanal = $direction === 'IN'
+        ? $db->fetchOne("SELECT FaturalarGelen_Kanal_id AS k FROM FaturalarGelen WHERE FaturalarGelen_FaturaNo = ?", [$faturaNo])
+        : $db->fetchOne("SELECT FaturalarGiden_Kanal_id AS k FROM FaturalarGiden WHERE FaturalarGiden_FaturaNo = ?", [$faturaNo]);
+    $kanalId = (int)($faturaKanal['k'] ?? 0) ?: 1;
+
     // ── 1. GİB'den çekmeyi dene ──────────────────────────────────────────────
-    $gibXml = fetchXmlFromGib($db, $faturaNo, $direction);
+    $gibXml = fetchXmlFromGib($db, $faturaNo, $direction, $kanalId);
 
     if ($gibXml) {
         $isEArsiv = false;
@@ -199,7 +204,7 @@ try {
         $gidenFatura['FaturalarGiden_Tutar'] = $netTutar + $toplamKdv;
     }
 
-    $tb          = TurkbelgeService::fromDb($db);
+    $tb          = TurkbelgeService::fromDb($db, $kanalId);
     $buildResult = $tb->buildUblXml($gidenFatura, $kalemler, $isEArsiv);
     $xmlString   = $buildResult['xml'];
 

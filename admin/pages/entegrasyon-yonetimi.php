@@ -59,7 +59,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $kd   = intval($_POST['Kanal_Durum']??1);
                 if (!$adi||!$eid) throw new Exception('Ad zorunludur.');
                 if ($id>0) {
-                    $db->execute("UPDATE EntegrasyonKanallari SET Kanal_Adi=?,Kanal_Ortam=?,Kanal_Endpoint=?,Kanal_Kullanici=?,Kanal_Sifre=?,Kanal_ApiKey=?,Kanal_Parametreler=?,Kanal_Varsayilan=?,Kanal_Durum=?,GuncelleyenKullanici=?,GuncellemeTarihi=GETDATE() WHERE Kanal_Id=?",
+                    // Şifre alanı düzenlemede boş gelir; boşsa mevcut şifre korunur
+                    $db->execute("UPDATE EntegrasyonKanallari SET Kanal_Adi=?,Kanal_Ortam=?,Kanal_Endpoint=?,Kanal_Kullanici=?,Kanal_Sifre=COALESCE(?,Kanal_Sifre),Kanal_ApiKey=?,Kanal_Parametreler=?,Kanal_Varsayilan=?,Kanal_Durum=?,GuncelleyenKullanici=?,GuncellemeTarihi=GETDATE() WHERE Kanal_Id=?",
                         [$adi,$ortam,$ep,$ku,$ks,$ka,$prm,$vars,$kd,$user['kullanici_id'],$id]);
                 } else {
                     $db->execute("INSERT INTO EntegrasyonKanallari(Kanal_Entegrasyon_Id,Kanal_Adi,Kanal_Ortam,Kanal_Endpoint,Kanal_Kullanici,Kanal_Sifre,Kanal_ApiKey,Kanal_Parametreler,Kanal_Varsayilan,Kanal_Durum,OlusturanKullanici,OlusturmaTarihi,GuncelleyenKullanici,GuncellemeTarihi,Durum) VALUES(?,?,?,?,?,?,?,?,?,?,?,GETDATE(),?,GETDATE(),1)",
@@ -347,6 +348,7 @@ function openKanalModal(){
     $('#kanalForm')[0].reset();
     $('#kanal_id').val('');
     $('#kanal_ent_id').val(seciliEntId);
+    $('#kanal_sifre').attr('placeholder', '');
     $('#kanalModalTitle').text('Yeni Kanal');
     kanalModalBs.show();
 }
@@ -360,7 +362,7 @@ function editKanal(id){
         $('#kanal_ortam').val(row.Kanal_Ortam);
         $('#kanal_endpoint').val(row.Kanal_Endpoint||'');
         $('#kanal_kullanici').val(row.Kanal_Kullanici||'');
-        $('#kanal_sifre').val('');
+        $('#kanal_sifre').val('').attr('placeholder', 'Değiştirmek için doldurun');
         $('#kanal_apikey').val(row.Kanal_ApiKey||'');
         $('#kanal_params').val(row.Kanal_Parametreler||'');
         $('#kanal_varsayilan').val(row.Kanal_Varsayilan);

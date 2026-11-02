@@ -140,6 +140,36 @@ class TurkbelgeService
         return null;
     }
 
+    // ── Fatura No Kontrolü (giden e-Fatura + e-Arşiv) ────────────────────
+
+    /**
+     * Fatura numarası bu hesapta daha önce kullanılmış mı?
+     * Seri portalda da aktif olabildiğinden gönderim öncesi çakışma kontrolü.
+     */
+    public function faturaNoKullanildiMi(string $faturaNo): bool
+    {
+        $header = [
+            'SESSION_ID'       => $this->sessionId,
+            'APPLICATION_NAME' => 'e-Fatura',
+            'COMPRESSED'       => 'N',
+        ];
+
+        $r = $this->efaturaClient->GetInvoice([
+            'REQUEST_HEADER'     => $header,
+            'INVOICE_SEARCH_KEY' => ['LIMIT' => 1, 'ID' => $faturaNo, 'DIRECTION' => 'OUT', 'READ_INCLUDED' => true],
+            'HEADER_ONLY'        => 'Y',
+        ]);
+        if (!empty($r->INVOICE)) return true;
+
+        $r = $this->earsivClient->GetEArchiveInvoiceList([
+            'REQUEST_HEADER' => $header,
+            'LIMIT'          => 1,
+            'ID'             => $faturaNo,
+            'HEADER_ONLY'    => 'Y',
+        ]);
+        return !empty($r->INVOICE);
+    }
+
     // ── e-Fatura: LoadInvoice → SendInvoice ──────────────────────────────
 
     public function efaturaGonder(string $xml, string $uuid, string $aliciVkn, string $aliciAlias, string $senaryo): array

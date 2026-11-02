@@ -19,11 +19,12 @@ class TurkbelgeAPI
      * Constructor
      * @param Database $db Database instance
      * @param string $ortam 'TEST' veya 'PROD'
+     * @param int $kanalId EntegrasyonKanallari.Kanal_Id (firma bazlı Türkbelge hesabı)
      */
-    public function __construct($db, $ortam = 'PROD')
+    public function __construct($db, $ortam = 'PROD', $kanalId = 1)
     {
         $this->db = $db;
-        $this->kanal = $this->getKanal($ortam);
+        $this->kanal = $this->getKanal($ortam, (int)$kanalId);
         
         $this->soapOptions = [
             'trace' => 1,
@@ -42,16 +43,16 @@ class TurkbelgeAPI
     /**
      * Entegrasyon kanalını veritabanından çek
      */
-    private function getKanal($ortam)
+    private function getKanal($ortam, $kanalId = 1)
     {
         $kanal = $this->db->fetchOne("
             SELECT ek.*, e.Entegrasyon_Kod
             FROM EntegrasyonKanallari ek
             INNER JOIN Entegrasyon e ON ek.Kanal_Entegrasyon_Id = e.Entegrasyon_Id
-            WHERE e.Entegrasyon_Kod = 'TURKBELGE' 
-              AND ek.Kanal_Id = 1 
+            WHERE e.Entegrasyon_Kod = 'TURKBELGE'
+              AND ek.Kanal_Id = ?
               AND ek.Kanal_Durum = 1
-        ");
+        ", [$kanalId]);
         
         if (!$kanal) {
             throw new Exception("TÜRKBELGE {$ortam} kanalı bulunamadı");

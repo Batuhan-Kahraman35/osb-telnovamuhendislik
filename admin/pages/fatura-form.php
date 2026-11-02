@@ -30,6 +30,63 @@ $iadeKaynakId       = isset($_GET['iade_kaynak'])          ? intval($_GET['iade_
 $fiyatFarkiKaynakId = isset($_GET['fiyat_farki_kaynak']) ? intval($_GET['fiyat_farki_kaynak']) : 0;
 $vadeFarkiKaynakId  = isset($_GET['vade_farki_kaynak'])  ? intval($_GET['vade_farki_kaynak'])  : 0;
 
+/**
+ * Faturayı kesecek firma (Türkbelge kanalı) ve serileri.
+ * Seriler kanal parametrelerinden okunur: fatura_seri (e-Fatura), earsiv_seri (yoksa fatura_seri).
+ * $kanalId = 0 ise varsayılan kanal döner.
+ */
+function faturaKanalBul($db, int $kanalId = 0): array
+{
+    $kanal = $db->fetchOne("
+        SELECT TOP 1 ek.Kanal_Id, ek.Kanal_Adi, ek.Kanal_Parametreler
+        FROM EntegrasyonKanallari ek
+        INNER JOIN Entegrasyon e ON e.Entegrasyon_Id = ek.Kanal_Entegrasyon_Id
+        WHERE e.Entegrasyon_Kod = 'TURKBELGE' AND ek.Kanal_Ortam = 'PROD'
+          AND ek.Kanal_Durum = 1 AND ek.Durum = 1
+          AND (? = 0 OR ek.Kanal_Id = ?)
+        ORDER BY ek.Kanal_Varsayilan DESC, ek.Kanal_Id
+    ", [$kanalId, $kanalId]);
+    if (!$kanal) throw new Exception('Faturayı kesecek Türkbelge kanalı bulunamadı.');
+
+    $p = json_decode($kanal['Kanal_Parametreler'] ?? '{}', true) ?: [];
+    $seri = strtoupper(trim((string)($p['fatura_seri'] ?? '')));
+    if (!preg_match('/^[A-Z0-9]{3}$/', $seri)) {
+        throw new Exception($kanal['Kanal_Adi'] . ' için fatura serisi tanımlı değil. Entegrasyon Yönetimi\'nden kanal parametrelerine 3 karakterlik "fatura_seri" ekleyin.');
+    }
+    $earsivSeri = strtoupper(trim((string)($p['earsiv_seri'] ?? '')));
+    if (!preg_match('/^[A-Z0-9]{3}$/', $earsivSeri)) $earsivSeri = $seri;
+
+    return ['id' => (int)$kanal['Kanal_Id'], 'ad' => $kanal['Kanal_Adi'], 'seri' => $seri, 'earsiv_seri' => $earsivSeri];
+}
+
+/** İade / fiyat farkı kaynak gelen faturanın, vade farkı kaynak giden faturanın firmasından kesilir */
+function faturaKanalIdBelirle($db, int $iadeKaynak, int $fiyatFarkiKaynak, int $vadeFarkiKaynak, int $mevcutKanal = 0): int
+{
+    if ($iadeKaynak || $fiyatFarkiKaynak) {
+        $r = $db->fetchOne("SELECT FaturalarGelen_Kanal_id AS k FROM FaturalarGelen WHERE FaturalarGelen_id = ?", [$iadeKaynak ?: $fiyatFarkiKaynak]);
+        return (int)($r['k'] ?? 0);
+    }
+    if ($vadeFarkiKaynak) {
+        $r = $db->fetchOne("SELECT FaturalarGiden_Kanal_id AS k FROM FaturalarGiden WHERE FaturalarGiden_id = ?", [$vadeFarkiKaynak]);
+        return (int)($r['k'] ?? 0);
+    }
+    return $mevcutKanal;
+}
+
+/** Seri + yıl için sıradaki fatura no (SSSYYYYNNNNNNNNN - 16 hane); silinmiş kayıtlar da sayılır */
+function sonrakiFaturaNo($db, string $seri, string $yil): string
+{
+    $prefix = $seri . $yil;
+    $son = $db->fetchOne("
+        SELECT TOP 1 FaturalarGiden_FaturaNo AS no
+        FROM FaturalarGiden
+        WHERE FaturalarGiden_FaturaNo LIKE ? AND LEN(FaturalarGiden_FaturaNo) = 16
+        ORDER BY FaturalarGiden_FaturaNo DESC
+    ", [$prefix . '%']);
+    $sira = $son ? (int)substr($son['no'], 7) + 1 : 1;
+    return $prefix . str_pad($sira, 9, '0', STR_PAD_LEFT);
+}
+
 $fatura = null;
 $kalemler = [];
 $cariDetay = null;
@@ -578,27 +635,20 @@ if ($faturaId > 0) {
     ];
 }
 
-// Yeni Fatura No Oluştur (TLNYYYYNNNNNNNNN - 16 hane)
+// Faturayı kesen firma ve yeni fatura no (firmanın serisinden)
+$faturaKanal = null;
+$faturaKanalHata = null;
+try {
+    $faturaKanal = faturaKanalBul($db, faturaKanalIdBelirle(
+        $db, $iadeKaynakId, $fiyatFarkiKaynakId, $vadeFarkiKaynakId, (int)($fatura['FaturalarGiden_Kanal_id'] ?? 0)
+    ));
+} catch (Exception $e) {
+    $faturaKanalHata = $e->getMessage();
+}
+
 $faturaNo = $fatura['FaturalarGiden_FaturaNo'] ?? '';
-if (!$faturaNo) {
-    $yil = date('Y');
-    // Prefix + Yil (TLN2026 gibi)
-    $prefix = 'TLN' . $yil;
-    
-    $sonFatura = $db->fetchOne("
-        SELECT TOP 1 FaturalarGiden_FaturaNo 
-        FROM FaturalarGiden 
-        WHERE FaturalarGiden_FaturaNo LIKE ? 
-        ORDER BY FaturalarGiden_FaturaNo DESC
-    ", [$prefix . '%']);
-    
-    if ($sonFatura && strlen($sonFatura['FaturalarGiden_FaturaNo']) == 16) {
-        $sonSiraStr = substr($sonFatura['FaturalarGiden_FaturaNo'], 7); // Son 9 hane
-        $sira = intval($sonSiraStr) + 1;
-    } else {
-        $sira = 1;
-    }
-    $faturaNo = $prefix . str_pad($sira, 9, '0', STR_PAD_LEFT);
+if (!$faturaNo && $faturaKanal) {
+    $faturaNo = sonrakiFaturaNo($db, $faturaKanal['seri'], date('Y'));
 }
 
 
@@ -653,6 +703,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$fat) throw new Exception('Fatura bulunamadı.');
             if ($fat['FaturalarGiden_Durum'] !== 'Taslak') throw new Exception('Sadece Taslak faturalar gönderilebilir.');
 
+            // Canlı gönderim faturanın kayıtlı olduğu firmanın (kanalın) hesabından yapılır
+            if (!$isTest) $kanalId = (int)($fat['FaturalarGiden_Kanal_id'] ?? 0) ?: 1;
+
             $kalemler = $db->fetchAll("SELECT * FROM FaturalarGidenKalemleri WHERE FaturalarGidenKalemleri_Fatura_id = ? ORDER BY FaturalarGidenKalemleri_Sira", [$fid]);
             if (empty($kalemler)) throw new Exception('Faturada kalem bulunamadı.');
 
@@ -671,6 +724,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $isIadeFatura = (($fat['FaturalarGiden_FaturaTipi'] ?? '') === 'IADE');
             if ($isIadeFatura && $isEArsiv) {
                 throw new Exception('Alıcı e-Fatura mükellefi olmadığından iade faturası gönderilemez. e-Arşiv faturaları için iptal süreci uygulanmalıdır.');
+            }
+
+            // Fatura no türüne uygun seriden olmalı ve Türkbelge'de kullanılmamış olmalı.
+            // e-Fatura / e-Arşiv ayrımı ancak burada belli olur; firmanın seri numarasıyla
+            // açılmış taslak, türünün serisine (ör. OSB → OSA) yeniden numaralanır.
+            if (!$isTest) {
+                $gonderenKanal = faturaKanalBul($db, $kanalId);
+                $beklenenSeri  = $isEArsiv ? $gonderenKanal['earsiv_seri'] : $gonderenKanal['seri'];
+                $yeniNo        = $fat['FaturalarGiden_FaturaNo'];
+                $mevcutSeri    = substr($yeniNo, 0, 3);
+
+                if ($mevcutSeri !== $beklenenSeri && in_array($mevcutSeri, [$gonderenKanal['seri'], $gonderenKanal['earsiv_seri']], true)) {
+                    $yeniNo = sonrakiFaturaNo($db, $beklenenSeri, substr($yeniNo, 3, 4));
+                }
+
+                // Seri portalda da aktif olabilir: kullanılmış numara atlanır
+                for ($deneme = 0; $tb->faturaNoKullanildiMi($yeniNo); $deneme++) {
+                    if ($deneme >= 20) throw new Exception("$yeniNo ve önceki numaralar {$gonderenKanal['ad']} Türkbelge hesabında kullanılmış. Seri sayacını kontrol edin.");
+                    $yeniNo = substr($yeniNo, 0, 7) . str_pad((int)substr($yeniNo, 7) + 1, 9, '0', STR_PAD_LEFT);
+                    $dbVar  = $db->fetchOne("SELECT 1 AS v FROM FaturalarGiden WHERE FaturalarGiden_FaturaNo = ?", [$yeniNo]);
+                    if ($dbVar) $yeniNo = sonrakiFaturaNo($db, substr($yeniNo, 0, 3), substr($yeniNo, 3, 4));
+                }
+
+                if ($yeniNo !== $fat['FaturalarGiden_FaturaNo']) {
+                    $db->execute("
+                        UPDATE FaturalarGiden SET FaturalarGiden_FaturaNo = ?, GuncelleyenKullanici = ?, GuncellemeTarihi = GETDATE()
+                        WHERE FaturalarGiden_id = ?
+                    ", [$yeniNo, $user['kullanici_id'], $fid]);
+                    $fat['FaturalarGiden_FaturaNo'] = $yeniNo;
+                }
             }
 
             $buildResult = $tb->buildUblXml($fat, $kalemler, $isEArsiv);
@@ -805,7 +888,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
-            echo json_encode(['success' => true, 'message' => "$tip olarak başarıyla gönderildi." . ($pazaryeriMesaj ?? ''), 'uuid' => $uuid, 'tip' => $tip]);
+            echo json_encode(['success' => true, 'message' => "$tip olarak başarıyla gönderildi (No: {$fat['FaturalarGiden_FaturaNo']})." . ($pazaryeriMesaj ?? ''), 'uuid' => $uuid, 'tip' => $tip]);
         } catch (Exception $e) {
             echo json_encode(['success' => false, 'message' => $e->getMessage()]);
         }
@@ -951,6 +1034,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('EUR cinsinden kalem var ancak ' . date('d.m.Y', strtotime($tarih)) . ' tarihine ait TCMB Euro kuru bulunamadı.');
                 }
 
+                // Kesen firma sunucuda belirlenir (istemciden alınmaz); düzenlemede mevcut firma korunur
+                $mevcut = $fid > 0
+                    ? $db->fetchOne("SELECT FaturalarGiden_Kanal_id AS k, FaturalarGiden_FaturaNo AS no, FaturalarGiden_Durum AS durum FROM FaturalarGiden WHERE FaturalarGiden_id = ?", [$fid])
+                    : null;
+                $kayitKanal = faturaKanalBul($db, faturaKanalIdBelirle($db, $iadeKaynakPost, $fiyatFarkiKaynakPost, $vadeFarkiKaynakPost, (int)($mevcut['k'] ?? 0)));
+
+                // Taslakta numara firmanın serisinden, fatura yılından ve tekil olmalı; değilse sıradaki numara verilir.
+                // Kesilmiş faturanın numarası değiştirilmez.
+                $girilenNo = $fno;
+                if ($mevcut && ($mevcut['durum'] ?? '') !== 'Taslak') {
+                    $fno = $mevcut['no'];
+                } else {
+                    $faturaYil = date('Y', strtotime($tarih));
+                    $noCakisma = $db->fetchOne("SELECT 1 AS v FROM FaturalarGiden WHERE FaturalarGiden_FaturaNo = ? AND FaturalarGiden_id <> ?", [$fno, $fid]);
+                    $noUygun = strlen($fno) === 16
+                        && in_array(substr($fno, 0, 3), [$kayitKanal['seri'], $kayitKanal['earsiv_seri']], true)
+                        && substr($fno, 3, 4) === $faturaYil;
+                    if ($noCakisma || !$noUygun) {
+                        $fno = sonrakiFaturaNo($db, $kayitKanal['seri'], $faturaYil);
+                    }
+                }
+
                 $netTutar = 0;
                 $toplamKdv = 0;
 
@@ -977,6 +1082,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $genelToplam = round($netTutar + $toplamKdv, 2);
 
                 if ($fid > 0) {
+                    if (($mevcut['durum'] ?? '') === 'Taslak') {
+                        $db->execute("UPDATE FaturalarGiden SET FaturalarGiden_Kanal_id = ? WHERE FaturalarGiden_id = ?", [$kayitKanal['id'], $fid]);
+                    }
                     $db->update('FaturalarGiden', [
                         'FaturalarGiden_FaturaNo' => $fno,
                         'FaturalarGiden_Tarih' => $tarih,
@@ -1002,6 +1110,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 } else {
                     $db->insert('FaturalarGiden', [
                         'FaturalarGiden_FaturaNo' => $fno,
+                        'FaturalarGiden_Kanal_id' => $kayitKanal['id'],
                         'FaturalarGiden_Teklif_id' => $tid ?: null,
                         'FaturalarGiden_Cari_id' => $cid,
                         'FaturalarGiden_Tarih' => $tarih,
@@ -1076,7 +1185,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     );
                 }
 
-                echo json_encode(['success' => true, 'message' => 'Fatura taslağı kaydedildi.', 'fatura_id' => $fid, 'pazaryeri_siparis_id' => $pzId]);
+                $kayitMesaj = 'Fatura taslağı kaydedildi.';
+                if ($fno !== $girilenNo) $kayitMesaj .= " Fatura no {$kayitKanal['ad']} serisine göre $fno olarak verildi.";
+                echo json_encode(['success' => true, 'message' => $kayitMesaj, 'fatura_id' => $fid, 'pazaryeri_siparis_id' => $pzId]);
                 break;
         }
     } catch (Exception $e) {
@@ -1269,6 +1380,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <div class="col-md-2 mt-3">
                                         <label class="form-label">Fatura No</label>
                                         <input type="text" class="form-control" name="fatura_no" value="<?= htmlspecialchars($faturaNo) ?>" required>
+                                        <?php if ($faturaKanal): ?>
+                                        <div class="form-text"><i class="bi bi-building me-1"></i>Kesen firma: <strong><?= htmlspecialchars($faturaKanal['ad']) ?></strong></div>
+                                        <?php else: ?>
+                                        <div class="form-text text-danger"><i class="bi bi-exclamation-triangle me-1"></i><?= htmlspecialchars($faturaKanalHata) ?></div>
+                                        <?php endif; ?>
                                     </div>
                                     <div class="col-md-2">
                                         <label class="form-label">Tarih</label>
