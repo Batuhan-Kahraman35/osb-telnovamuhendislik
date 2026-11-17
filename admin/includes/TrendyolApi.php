@@ -743,29 +743,54 @@ class TrendyolApi extends PazaryeriApi
         $durum   = $ilk['claimItemStatus']['name'] ?? ($i['status'] ?? '');
         $musteri = trim(($i['customerFirstName'] ?? '') . ' ' . ($i['customerLastName'] ?? ''));
 
+        // Genel durum tüm kalemlerden (açık > onaylandı > reddedildi > iptal);
+        // iptal / reddedilen kalem iade adedine ve tutara katılmaz
+        $kodlar = array_map(fn($k) => $this->iadeDurumKodu($k['durum']), $kalemler);
+        $durumKod = 'diger';
+        foreach (['acik', 'onaylandi', 'reddedildi', 'iptal'] as $k) {
+            if (in_array($k, $kodlar, true)) { $durumKod = $k; break; }
+        }
+        if (!$kalemler) {
+            $durumKod = $this->iadeDurumKodu($durum);
+        }
+        $tutar = 0.0;
+        foreach ($kalemler as $n => $k) {
+            if (in_array($kodlar[$n], ['iptal', 'reddedildi'], true)) {
+                $kalemler[$n]['miktar'] = 0;
+            } else {
+                $tutar += (float)($k['fiyat'] ?? 0);
+            }
+        }
+
         return [
             'disId'      => (string)($i['id'] ?? ($i['claimId'] ?? '')),
             'siparisNo'  => (string)($i['orderNumber'] ?? ''),
             'paketNo'    => (string)($i['orderShipmentPackageId'] ?? ''),
-            'durumKod'   => $this->iadeDurumKodu($durum),
+            'durumKod'   => $durumKod,
             'hamDurum'   => $durum ?: null,
             'sebep'      => $kalemler[0]['sebep'] ?? null,
             'aciklama'   => $ilk['customerNote'] ?? null,
             'musteriAdi' => $musteri ?: null,
-            'tutar'      => array_sum(array_map(fn($k) => (float)($k['fiyat'] ?? 0), $kalemler)) ?: null,
+            'tutar'      => $kalemler ? round($tutar, 2) : null,
             'iadeTarihi' => $this->msTarih($i['claimDate'] ?? null),
             'kalemler'   => $kalemler,
             'ham'        => $i
         ];
     }
 
+    /**
+     * claimItemStatus.name → nötr kod. Trendyol durumları: Created, WaitingInAction,
+     * WaitingFraudCheck, InAnalysis, Unresolved (açık) · Accepted · Rejected · Cancelled
+     */
     private function iadeDurumKodu($durum)
     {
         $d = strtolower((string)$durum);
-        if (strpos($d, 'waiting') !== false || strpos($d, 'created') !== false) return 'acik';
+        if ($d === '') return 'diger';
         if (strpos($d, 'accept')  !== false || strpos($d, 'approved') !== false) return 'onaylandi';
-        if (strpos($d, 'reject')  !== false || strpos($d, 'unresolved') !== false) return 'reddedildi';
+        if (strpos($d, 'reject')  !== false)                                     return 'reddedildi';
         if (strpos($d, 'cancel')  !== false)                                     return 'iptal';
+        if (strpos($d, 'waiting') !== false || strpos($d, 'created') !== false
+            || strpos($d, 'analysis') !== false || strpos($d, 'unresolved') !== false) return 'acik';
         return 'diger';
     }
 

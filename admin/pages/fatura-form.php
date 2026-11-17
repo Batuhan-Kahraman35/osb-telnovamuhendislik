@@ -1034,6 +1034,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new Exception('EUR cinsinden kalem var ancak ' . date('d.m.Y', strtotime($tarih)) . ' tarihine ait TCMB Euro kuru bulunamadı.');
                 }
 
+                // Dövizli kalemin TL fiyatı sunucuda, fatura tarihinin kuruyla hesaplanır.
+                // İstemcideki çevrim AJAX ile gelen kura bağlıdır; kur gelmeden kaydedilirse
+                // döviz tutarı TL diye yazılıyordu (60,50 EUR → 60,50 TL).
+                // Fiyat farkı / vade farkı kalemleri kaynak faturanın kurunu kullanır, dokunulmaz.
+                if (!$fiyatFarkiKaynakPost && !$vadeFarkiKaynakPost) {
+                    foreach ($kalemlerData as &$k) {
+                        $pb  = strtoupper(trim($k['para_birimi'] ?? 'TRY'));
+                        $orj = floatval($k['orijinal_fiyat'] ?? 0);
+                        $kur = $pb === 'USD' ? $dolarKur : ($pb === 'EUR' ? $euroKur : 0);
+                        if ($kur > 0 && $orj > 0) {
+                            $k['birim_fiyat'] = round($orj * $kur, 4);
+                        }
+                    }
+                    unset($k);
+                }
+
                 // Kesen firma sunucuda belirlenir (istemciden alınmaz); düzenlemede mevcut firma korunur
                 $mevcut = $fid > 0
                     ? $db->fetchOne("SELECT FaturalarGiden_Kanal_id AS k, FaturalarGiden_FaturaNo AS no, FaturalarGiden_Durum AS durum FROM FaturalarGiden WHERE FaturalarGiden_id = ?", [$fid])
@@ -1846,6 +1862,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             hesapla();
         });
 
+        // Dövizli satırda TL fiyat elle değiştirilirse döviz karşılığı da güncellenir;
+        // sunucu TL fiyatı döviz fiyatından yeniden hesapladığı için elle giriş korunur.
+        $(document).on('input', '.k-fiyat', function() {
+            const tr = $(this).closest('tr');
+            if (tr.find('.k-doviz-fiyat').length) return; // fiyat farkı kalemi kendi alanını kullanır
+            const pb  = tr.find('.k-pb').val() || 'TRY';
+            const kur = pb === 'USD' ? (parseFloat($('#dolar_kur').val()) || 0)
+                      : pb === 'EUR' ? (parseFloat($('#euro_kur').val())  || 0) : 0;
+            if (kur <= 0) return;
+            const orj = (parseFloat($(this).val()) || 0) / kur;
+            tr.attr('data-orijinal-fiyat', orj).data('orijinal-fiyat', orj);
+        });
+
         // Sayfa açılışında kur varsa uygula
         kurUygula();
 
@@ -2024,6 +2053,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     miktar: $(this).find('.k-miktar').val(),
                     birim: $(this).find('.k-birim').val(),
                     para_birimi: $(this).find('.k-pb').val() || 'TRY',
+                    // Döviz cinsinden fiyat: TL karşılığını sunucu fatura tarihinin kuruyla hesaplar
+                    orijinal_fiyat: parseFloat($(this).attr('data-orijinal-fiyat')) || 0,
                     birim_fiyat: $(this).find('.k-fiyat').val(),
                     kdv_oran: $(this).find('.k-kdv').val()
                 });
@@ -2031,6 +2062,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if (kalemler.length === 0) {
                 Swal.fire('Hata', 'En az bir kalem eklemelisiniz', 'warning');
+                return;
+            }
+
+            // Dövizli kalem varken kur henüz alınmadıysa ekrandaki tutar döviz cinsindendir;
+            // kullanıcı yanlış toplamı onaylamasın diye kur gelene kadar kaydetme durdurulur.
+            const kurEksik = kalemler.some(k =>
+                (k.para_birimi === 'USD' && !(parseFloat($('#dolar_kur').val()) > 0)) ||
+                (k.para_birimi === 'EUR' && !(parseFloat($('#euro_kur').val())  > 0)));
+            if (kurEksik) {
+                kurlariGetir();
+                Swal.fire('Kur Bekleniyor', 'Dövizli kalemlerin TL karşılığı için fatura tarihine ait kur alınıyor. Tutarlar güncellendikten sonra tekrar kaydedin.', 'warning');
                 return;
             }
 

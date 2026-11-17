@@ -58,8 +58,9 @@ class DovizKuruHelper
 
         if ($this->onbellekBayatMi($kanal)) {
             $cekim = $this->tcmbdenCek($kanal, $kullaniciId);
-            // Cekim basarisizsa sessizce dusuyoruz: asagida son bilinen kur okunur.
+            // Cekim basarisizsa son bilinen kur okunur; hata iz birakmasi icin loglanir.
             if (!$cekim['success']) {
+                error_log('TCMB kur cekimi basarisiz: ' . $cekim['message']);
                 $veri = $this->veritabanindanOku($hesap);
                 $veri['message'] = $cekim['message'];
                 $veri['kaynak']  = 'cache';
@@ -306,12 +307,13 @@ class DovizKuruHelper
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 8,
-            CURLOPT_CONNECTTIMEOUT => 5,
+            // TCMB zaman zaman 5 sn'yi asan baglanti suresiyle yanit veriyor
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_FOLLOWLOCATION => true,
         ]);
         $xmlStr   = curl_exec($ch);
-        $httpKod  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $httpKod  = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlHata = curl_error($ch);
         curl_close($ch);
 
@@ -319,16 +321,17 @@ class DovizKuruHelper
             return [
                 'success' => false,
                 'xml'     => null,
+                'http'    => $httpKod,
                 'message' => 'TCMB kurlari alinamadi' . ($curlHata ? ": {$curlHata}" : " (HTTP {$httpKod})") . '.',
             ];
         }
 
         $xml = @simplexml_load_string($xmlStr);
         if (!$xml || !isset($xml->Currency)) {
-            return ['success' => false, 'xml' => null, 'message' => 'TCMB yaniti okunamadi.'];
+            return ['success' => false, 'xml' => null, 'http' => $httpKod, 'message' => 'TCMB yaniti okunamadi.'];
         }
 
-        return ['success' => true, 'xml' => $xml, 'message' => null];
+        return ['success' => true, 'xml' => $xml, 'http' => $httpKod, 'message' => null];
     }
 
     /**
@@ -414,17 +417,57 @@ class DovizKuruHelper
 
         $hesap = $this->faturaHesapTipiGetir($this->kanalGetir());
 
-        $kur = $this->tablodanKurOku($tarih, $paraBirimi, $hesap);
-        if ($kur !== null) {
-            return $kur;
+        // Tablodaki en yakin yayin, fatura tarihinden onceki son is gununden eskiyse
+        // bayattir: arada TCMB yayini olmus ama tabloya yazilamamistir. Eskiden bu
+        // kayit sessizce kullaniliyordu; widget cekimi 24.10'da durunca 27.10 - 09.11
+        // arasi tum dovizli faturalar 23.10 kuruyla kesildi.
+        $sonYayin = $this->tablodakiSonYayin($tarih, $paraBirimi);
+        if ($sonYayin !== null && $sonYayin >= $this->oncekiIsGunu($tarih)) {
+            return $this->tablodanKurOku($tarih, $paraBirimi, $hesap);
         }
 
-        // Tabloda o doneme ait yayin yok: arsivden doldurup tekrar dene.
+        // Kayit yok ya da bayat: arsivden doldurup tekrar dene. Arsive ulasilamazsa
+        // bayat kur KULLANILMAZ, null doner ve fatura "kur bulunamadi" ile durur.
         if ($this->arsivdenDoldur($tarih, $kullaniciId)) {
             return $this->tablodanKurOku($tarih, $paraBirimi, $hesap);
         }
 
+        error_log("Fatura kuru cozulemedi: {$tarih} {$paraBirimi}, tablodaki son yayin " . ($sonYayin ?? 'yok') . '.');
         return null;
+    }
+
+    /** Fatura tarihinden kucuk en yakin yayinin tarihi (Y-m-d) */
+    private function tablodakiSonYayin(string $tarih, string $paraBirimi): ?string
+    {
+        $satir = $this->db->fetchOne("
+            SELECT CONVERT(VARCHAR(10), MAX(DovizKurlari_Tarih), 23) AS t
+            FROM dbo.tanim_DovizKurlari
+            WHERE DovizKurlari_ParaBirimi = ? AND DovizKurlari_Tarih < ? AND Durum = 1
+        ", [$paraBirimi, $tarih]);
+
+        return !empty($satir['t']) ? $satir['t'] : null;
+    }
+
+    /** Verilen tarihten onceki son hafta ici gun (Y-m-d). Resmi tatiller arsiv taramasinda cozulur. */
+    private function oncekiIsGunu(string $tarih): string
+    {
+        $gun = new DateTime($tarih);
+        do {
+            $gun->modify('-1 day');
+        } while ((int)$gun->format('N') >= 6);
+
+        return $gun->format('Y-m-d');
+    }
+
+    /** Bu tarihe ait yayin tabloda var mi */
+    private function yayinTablodaVar(string $tarih): bool
+    {
+        $satir = $this->db->fetchOne("
+            SELECT TOP 1 1 AS v FROM dbo.tanim_DovizKurlari
+            WHERE DovizKurlari_Tarih = ? AND Durum = 1
+        ", [$tarih]);
+
+        return !empty($satir);
     }
 
     /**
@@ -474,11 +517,26 @@ class DovizKuruHelper
         for ($i = 0; $i < self::ARSIV_AZAMI_GUN; $i++) {
             $gun->modify('-1 day');
 
+            // Hafta sonu yayin yapilmaz, istek atilmaz
+            if ((int)$gun->format('N') >= 6) {
+                continue;
+            }
+
+            // Bu gunun yayini zaten tabloda: aradaki gunler tatildir, tablodaki kayit gecerlidir
+            if ($this->yayinTablodaVar($gun->format('Y-m-d'))) {
+                return true;
+            }
+
             $url = $kok . $gun->format('Ym') . '/' . $gun->format('dmY') . '.xml';
 
             $indirme = $this->xmlIndir($url);
             if (!$indirme['success']) {
-                continue; // tatil/hafta sonu: o gune ait dosya yok
+                // Baglanti hatasi (HTTP 0): TCMB'ye ulasilamiyor, geriye taramak sayfayi kilitler
+                if (($indirme['http'] ?? 0) === 0) {
+                    error_log("TCMB arsivine ulasilamadi ({$url}): " . $indirme['message']);
+                    return false;
+                }
+                continue; // 404: resmi tatil, o gune ait dosya yok
             }
 
             if ($this->xmlIsle($indirme['xml'], $kullaniciId)['success']) {
