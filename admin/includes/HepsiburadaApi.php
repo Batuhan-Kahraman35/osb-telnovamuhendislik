@@ -655,21 +655,33 @@ class HepsiburadaApi extends PazaryeriApi
         return ['basarili' => true, 'hata' => '', 'adet' => $adet];
     }
 
-    /** Hepsiburada iadesi → nötr iade (her kayıt tek kalemdir) */
+    /**
+     * Hepsiburada iadesi → nötr iade (her kayıt tek kalemdir)
+     *
+     * claimType iade olmayan talepleri de kapsar [CANLI 17.11.2026]: MissingInvoice
+     * (eksik fatura), MissingItem (eksik ürün), RenewProduct (değişim). Bunlarda iade
+     * adedi 0, tutar boş yazılır; yalnız Return ve UndeliveredProduct ürün iadesidir
+     * (pazaryeri-modul v2.4.4 ile aynı kural).
+     */
     private function iadeNotrle(array $i)
     {
         $teslimat = $i['Deliveries'][0] ?? [];
         $sebep    = $i['Reason'] ?? ($i['reason'] ?? null);
+        $tur      = (string)($i['claimType'] ?? '');
+        $iadeMi   = in_array($tur, ['Return', 'UndeliveredProduct'], true);
+        $adet     = (int)($i['quantity'] ?? 1);
 
         $kalemler = [[
             'barkod'  => null,                         // iade kaydında barkod yok
             'stokKodu'=> $i['MerchantSku'] ?? null,
             'disUrunId' => $i['sku'] ?? null,
             'urunAdi' => null,
-            'miktar'  => (int)($i['quantity'] ?? 1),
-            'fiyat'   => isset($i['totalPriceAmount']) ? (float)$i['totalPriceAmount'] : null,
+            'miktar'  => $iadeMi ? $adet : 0,          // iade olmayan talep türünde 0
+            'talep'   => $adet,
+            'fiyat'   => $this->tutar($i['priceAmount'] ?? null),   // birim fiyat
             'sebep'   => $sebep,
             'durum'   => $i['status'] ?? null,
+            'tur'     => $tur ?: null,
         ]];
 
         $aciklama = trim(implode(' | ', array_filter([
@@ -682,11 +694,11 @@ class HepsiburadaApi extends PazaryeriApi
             'siparisNo'  => (string)($i['orderNumber'] ?? ''),
             'paketNo'    => (string)($teslimat['PackageNumber'] ?? ''),
             'durumKod'   => $this->iadeDurumKodu($i['status'] ?? ''),
-            'hamDurum'   => $i['status'] ?? null,
+            'hamDurum'   => trim(($i['status'] ?? '') . ($tur !== '' && $tur !== 'Return' ? ' · ' . $tur : '')) ?: null,
             'sebep'      => $sebep,
             'aciklama'   => $aciklama !== '' ? $aciklama : null,
             'musteriAdi' => $i['customerName'] ?? null,
-            'tutar'      => isset($i['totalPriceAmount']) ? (float)$i['totalPriceAmount'] : null,
+            'tutar'      => $iadeMi ? $this->tutar($i['totalPriceAmount'] ?? null) : null,
             'iadeTarihi' => $this->isoTarih($i['claimDate'] ?? null),
             'kalemler'   => $kalemler,
             'ham'        => $i
@@ -698,7 +710,8 @@ class HepsiburadaApi extends PazaryeriApi
     {
         $d = strtolower((string)$durum);
         if (strpos($d, 'new') !== false || strpos($d, 'waiting') !== false
-            || strpos($d, 'awaiting') !== false || strpos($d, 'open') !== false)  return 'acik';
+            || strpos($d, 'awaiting') !== false || strpos($d, 'open') !== false
+            || strpos($d, 'created') !== false)                                   return 'acik';
         if (strpos($d, 'accept') !== false || strpos($d, 'approve') !== false
             || strpos($d, 'refund') !== false)                                    return 'onaylandi';
         if (strpos($d, 'reject') !== false)                                       return 'reddedildi';
